@@ -514,12 +514,12 @@ conquistada pela conversa, nunca instantânea ou artificial.
 
 FORMATO_SAIDA = """
 FORMATO DA SUA RESPOSTA — responda SOMENTE com um objeto JSON válido (sem markdown, sem texto fora do JSON):
-{"fala": "o que o personagem diz, em português brasileiro, sem marcações de cena dentro do texto",
+{"fala": "OBRIGATÓRIA, nunca vazia: o que o personagem DIZ em voz alta, respondendo diretamente ao que o participante acabou de escrever. Sem gestos, sem parênteses, sem descrição de cena",
  "acao": "gesto/atitude curta entre parênteses, opcional (ex.: \\"(cruza os braços)\\"), ou string vazia",
  "emocao": "uma de: neutro, serio, sorriso, alegria, surpresa, desconfianca, irritacao, tristeza, determinacao, ironia",
  "aprovado": true ou false,
  "sinal_seguranca": "none | distress | minor_suspected | content_boundary"}
-Regras de formato: a "fala" costuma ter de 1 a 4 frases (no máximo cerca de 90 palavras), salvo quando o ESTADO pedir a despedida
+Regras de formato: gestos e atitudes vão SOMENTE no campo "acao", nunca dentro da "fala". Uma resposta com "fala" vazia ou só com gesto é inválida. A "fala" costuma ter de 1 a 4 frases (no máximo cerca de 90 palavras), salvo quando o ESTADO pedir a despedida
 ou a decisão final (até cerca de 150 palavras). Sem emojis. Nunca mencione o JSON, o ESTADO, a rubrica, o avaliador ou a
 aplicação. "emocao" deve refletir a emoção predominante da fala, considerando o contexto.
 """
@@ -870,6 +870,10 @@ def bloco_estado(cid, et, modo, ava, nota=""):
     ch = CHARS[cid]
     turns = et["turns"]
     L = ["Trocas já realizadas nesta etapa: %d." % turns]
+    ult_user = next((m["texto"] for m in reversed(et["msgs"]) if m["role"] == "user"), "")
+    if ult_user:
+        L.append("Última fala do participante: \"%s\". Responda DIRETAMENTE a ela, com uma fala dita em voz alta (nunca só um gesto). "
+                 "Se ele repetiu algo, reaja a essa repetição de forma natural, sem repetir a sua pergunta anterior com as mesmas palavras." % ult_user[:300])
     if ava:
         L.append("Parecer do avaliador (interno, nunca revele): " + "; ".join(
             "%s=%s" % (k, v["estado"]) for k, v in ava["criterios"].items()))
@@ -931,20 +935,40 @@ def mensagens_para_api(et):
     api = [{"role": "user", "content": "[O participante acaba de entrar na sala e você acabou de recebê-lo. Aguarde a primeira resposta.]"}]
     for m in et["msgs"]:
         if m["role"] == "assistant":
+            fala_limpa, acao_limpa = separar_cena(m["texto"], m.get("acao", ""))
             api.append({"role": "assistant", "content": json.dumps(
-                {"fala": m["texto"], "acao": m.get("acao", ""), "emocao": m.get("emocao", "neutro"),
+                {"fala": fala_limpa or m["texto"], "acao": acao_limpa, "emocao": m.get("emocao", "neutro"),
                  "aprovado": False, "sinal_seguranca": "none"}, ensure_ascii=False)})
         else:
             api.append({"role": "user", "content": m["texto"]})
     return api
 
 
+RE_PARENTESES = re.compile(r"\(([^()]*)\)")
+
+
+def separar_cena(fala, acao=""):
+    """Tira gestos entre parênteses de dentro da fala e os move para 'acao'. Retorna (fala_limpa, acao)."""
+    fala = str(fala or "")
+    gestos = [g.strip() for g in RE_PARENTESES.findall(fala) if g.strip()]
+    limpa = RE_PARENTESES.sub("", fala)
+    limpa = re.sub(r"[ \t]+\n", "\n", limpa)
+    limpa = re.sub(r"\n{3,}", "\n\n", limpa)
+    limpa = re.sub(r"[ \t]{2,}", " ", limpa).strip()
+    acao = (acao or "").strip()
+    if not acao and gestos:
+        acao = "(" + " ".join(g if g[-1] in ".!?…" else g + "." for g in gestos) + ")"
+    return limpa, acao
+
+
 def limpar_resp(d):
     if not isinstance(d, dict):
         return None
-    fala = str(d.get("fala", "")).strip()
+    fala, acao_extra = separar_cena(d.get("fala", ""), str(d.get("acao", "") or ""))
     if not fala:
-        return None
+        return None  # veio só gesto / fala vazia: o chamador pede de novo
+    d = dict(d)
+    d["acao"] = acao_extra
     emo = str(d.get("emocao", "neutro")).strip().lower()
     emo = {"desconfiança": "desconfianca", "irritação": "irritacao", "determinação": "determinacao",
            "sério": "serio"}.get(emo, emo)
@@ -959,18 +983,26 @@ def limpar_resp(d):
 
 def rodar_ator(cid, et, modo, ava, nota=""):
     ch = CHARS[cid]
-    system = (BASE + "\n\n=== MÓDULO DO PERSONAGEM ===\n" + ch["modulo"] +
-              "\n\n=== MEMÓRIA DOS ENCONTROS ANTERIORES ===\n" + memoria_bloco() +
-              "\n\n=== ESTADO ATUAL (mantido pela aplicação) ===\n" + bloco_estado(cid, et, modo, ava, nota) +
-              "\n\n=== FORMATO ===\n" + FORMATO_SAIDA)
-    bruto = chamar_claude(modelo_ator(), system, mensagens_para_api(et), max_tokens=900)
-    r = limpar_resp(extrair_json(bruto))
-    if r is None:  # modelo respondeu fora do formato: aproveita o texto como fala
-        txt = re.sub(r"[{}\"]", "", bruto or "").strip()
-        if not txt:
-            raise ErroIA("O personagem não respondeu. Tente novamente.")
-        r = {"fala": txt[:900], "acao": "", "emocao": "neutro", "aprovado": False, "sinal": "none"}
-    return r
+    base_sys = (BASE + "\n\n=== MÓDULO DO PERSONAGEM ===\n" + ch["modulo"] +
+                "\n\n=== MEMÓRIA DOS ENCONTROS ANTERIORES ===\n" + memoria_bloco() +
+                "\n\n=== ESTADO ATUAL (mantido pela aplicação) ===\n{ESTADO}" +
+                "\n\n=== FORMATO ===\n" + FORMATO_SAIDA)
+    corrige = ""
+    for tentativa in range(3):
+        estado = bloco_estado(cid, et, modo, ava, (nota + " " + corrige).strip())
+        system = base_sys.replace("{ESTADO}", estado)
+        bruto = chamar_claude(modelo_ator(), system, mensagens_para_api(et), max_tokens=900)
+        d = extrair_json(bruto)
+        r = limpar_resp(d)
+        if r is not None:
+            return r
+        if d is None:  # modelo respondeu fora do formato JSON: aproveita o texto como fala
+            fala, acao = separar_cena(re.sub(r"[{}\"]", "", bruto or ""))
+            if fala:
+                return {"fala": fala[:900], "acao": acao, "emocao": "neutro", "aprovado": False, "sinal": "none"}
+        corrige = ("Sua resposta anterior veio sem fala (só gesto ou vazia). Escreva agora uma FALA dita em voz alta, "
+                   "respondendo diretamente ao que o participante acabou de dizer; o gesto vai só em 'acao'.")
+    raise ErroIA("O personagem não respondeu. Tente novamente.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1536,7 +1568,7 @@ def historico(cid, et, excluir_ultimo=True):
     ms = et["msgs"][:-1] if excluir_ultimo else et["msgs"]
     if not ms:
         return
-    with st.expander("Ver conversa anterior (%d mensagens)" % len(ms)):
+    with st.expander("Ver conversa anterior (%d mensagens)" % len(ms), expanded=True):
         for m in ms:
             if m["role"] == "user":
                 with st.chat_message("user"):
