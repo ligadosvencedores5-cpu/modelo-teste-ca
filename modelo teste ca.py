@@ -665,6 +665,13 @@ def chamar_claude(modelo, system, mensagens, max_tokens=800, json_mode=True):
                 ultimo = "limite de uso da Groq atingido; aguarde alguns segundos"
                 time.sleep(3 + 3 * tentativa)
                 continue
+            if r.status_code in (400, 404) and gk and tentativa == 0 and "model" in r.text.lower():
+                S.pop("groq_modelos", None)
+                novo = modelos_groq(forcar=True)
+                alvo = escolher_modelo(PREF_AVAL if modelo == modelo_avaliador() else PREF_ATOR, modelo)
+                if novo and alvo != corpo["model"]:
+                    corpo["model"] = alvo
+                    continue
             if r.status_code in (400, 401, 403, 404):
                 try:
                     ultimo += " — " + r.json().get("error", {}).get("message", "")
@@ -691,15 +698,48 @@ def extrair_json(texto):
         return None
 
 
+PREF_ATOR = ["gpt-oss-120b", "llama-3.3-70b", "llama-4-maverick", "llama-4-scout", "kimi", "llama-3.1-70b", "gpt-oss-20b", "qwen", "llama-3.1-8b"]
+PREF_AVAL = ["llama-3.1-8b", "gpt-oss-20b", "llama-4-scout", "llama-3.3-70b", "gpt-oss-120b", "kimi", "qwen"]
+EXCLUIR = ("whisper", "guard", "tts", "orpheus", "playai", "embed", "distil", "compound", "safeguard")
+
+
+def modelos_groq(forcar=False):
+    """Lista os modelos de texto realmente disponíveis para a chave (cache na sessão)."""
+    S = st.session_state
+    if S.get("groq_modelos") and not forcar:
+        return S["groq_modelos"]
+    gk = chave_groq()
+    if not gk:
+        return []
+    try:
+        r = requests.get(GROQ_MODELOS_URL, headers={"Authorization": "Bearer " + gk}, timeout=20)
+        ids = [m.get("id", "") for m in r.json().get("data", []) if m.get("active", True)] if r.status_code == 200 else []
+    except Exception:
+        ids = []
+    ids = sorted(i for i in ids if i and not any(x in i.lower() for x in EXCLUIR))
+    if ids:
+        S["groq_modelos"] = ids
+    return ids
+
+
+def escolher_modelo(prefs, fallback):
+    ids = modelos_groq()
+    for p in prefs:
+        for i in ids:
+            if p in i.lower():
+                return i
+    return ids[0] if ids else fallback
+
+
 def modelo_ator():
     if chave_groq():
-        return segredo("MODELO_ATOR_GROQ", GROQ_ATOR_PADRAO)
+        return st.session_state.get("groq_ator_escolhido") or segredo("MODELO_ATOR_GROQ") or escolher_modelo(PREF_ATOR, GROQ_ATOR_PADRAO)
     return segredo("MODELO_ATOR", MODELO_ATOR_PADRAO)
 
 
 def modelo_avaliador():
     if chave_groq():
-        return segredo("MODELO_AVALIADOR_GROQ", GROQ_AVALIADOR_PADRAO)
+        return segredo("MODELO_AVALIADOR_GROQ") or escolher_modelo(PREF_AVAL, GROQ_AVALIADOR_PADRAO)
     return segredo("MODELO_AVALIADOR", MODELO_AVALIADOR_PADRAO)
 
 
@@ -909,8 +949,14 @@ def reset_jogo(manter_prologo=True):
     S = st.session_state
     visto = S.get("prologo_visto", False) and manter_prologo
     gk = S.get("groq_key")
+    gm = S.get("groq_modelos")
+    ge = S.get("groq_ator_escolhido")
     for k in list(S.keys()):
         del S[k]
+    if gm:
+        S["groq_modelos"] = gm
+    if ge:
+        S["groq_ator_escolhido"] = ge
     S["prologo_visto"] = visto
     if gk:
         S["groq_key"] = gk
@@ -1274,8 +1320,15 @@ def campo_chave():
     if S.get("groq_key"):
         k = S["groq_key"]
         st.success("Chave conectada: %s…%s" % (k[:4], k[-4:]))
+        ids = modelos_groq()
+        if ids:
+            atual = S.get("groq_ator_escolhido") or escolher_modelo(PREF_ATOR, ids[0])
+            S["groq_ator_escolhido"] = st.selectbox("Modelo dos personagens (disponíveis na sua conta)", ids,
+                                                    index=ids.index(atual) if atual in ids else 0)
         if st.button("Trocar ou remover a chave", key="trocar_chave"):
             S.pop("groq_key", None)
+            S.pop("groq_modelos", None)
+            S.pop("groq_ator_escolhido", None)
             st.rerun()
         return
     if segredo("GROQ_API_KEY") or segredo("ANTHROPIC_API_KEY"):
@@ -1293,6 +1346,8 @@ def campo_chave():
                 ok, msg = validar_groq(c)
             if ok:
                 S["groq_key"] = c
+                S.pop("groq_modelos", None)
+                modelos_groq(forcar=True)
                 st.rerun()
             else:
                 st.error(msg)
