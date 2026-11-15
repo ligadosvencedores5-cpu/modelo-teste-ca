@@ -7,8 +7,11 @@ COMO PUBLICAR (GitHub + Streamlit Community Cloud)
   1. Suba este arquivo (app.py) para um repositório do GitHub.
   2. Em share.streamlit.io, crie um app apontando para o repositório e para app.py.
   3. Em "Advanced settings > Secrets", cole:
-         ANTHROPIC_API_KEY = "sua-chave-aqui"
-         # opcionais:
+         # OPCIONAL — o jogador já cola a própria chave Groq (gratuita) na tela de entrada.
+         # Só configure se quiser que o app tenha uma chave padrão:
+         # GROQ_API_KEY = "gsk_..."
+         # ANTHROPIC_API_KEY = "sua-chave-aqui"
+         # outros opcionais:
          # MODELO_ATOR = "claude-sonnet-5-5"
          # MODELO_AVALIADOR = "claude-haiku-5-5"
          # DEBUG = "1"        (mostra o registro estruturado do avaliador na barra lateral)
@@ -41,6 +44,10 @@ API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 MODELO_ATOR_PADRAO = "claude-sonnet-5-5"
 MODELO_AVALIADOR_PADRAO = "claude-haiku-5-5"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELOS_URL = "https://api.groq.com/openai/v1/models"
+GROQ_ATOR_PADRAO = "llama-3.3-70b-versatile"
+GROQ_AVALIADOR_PADRAO = "llama-3.1-8b-instant"
 
 MAX_CHARS_MENSAGEM = 800
 MAX_CHAMADAS_POR_SESSAO = 260
@@ -82,7 +89,7 @@ AVISO_IA = ("Os personagens desta experiência são criados por inteligência ar
             "As conversas são ficção e podem tocar em temas emocionais. "
             "A experiência é indicada para maiores de 18 anos.")
 
-AVISO_DADOS = ("Para gerar as respostas, o texto que você escreve é enviado a um serviço de IA (Anthropic). "
+AVISO_DADOS = ("Para gerar as respostas, o texto que você escreve é enviado ao serviço de IA da chave que você informar (Groq). "
                "Não peça nem informe dados pessoais identificáveis (documentos, endereço, contatos, dados "
                "financeiros). A conversa fica apenas nesta sessão do navegador e é apagada ao fechar ou "
                "recomeçar a jornada.")
@@ -602,24 +609,62 @@ class ErroIA(Exception):
     pass
 
 
-def chamar_claude(modelo, system, mensagens, max_tokens=800):
-    chave = segredo("ANTHROPIC_API_KEY")
-    if not chave:
-        raise ErroIA("Chave da API não configurada.")
+def chave_groq():
+    return st.session_state.get("groq_key") or segredo("GROQ_API_KEY")
+
+
+def tem_chave():
+    return bool(chave_groq() or segredo("ANTHROPIC_API_KEY"))
+
+
+def validar_groq(chave):
+    """Testa a chave no próprio servidor da Groq. Retorna (ok, mensagem)."""
+    try:
+        r = requests.get(GROQ_MODELOS_URL, headers={"Authorization": "Bearer " + chave}, timeout=20)
+    except requests.RequestException:
+        return False, "Não foi possível conectar à Groq agora. Tente de novo."
+    if r.status_code == 200:
+        return True, "Chave aceita pela Groq."
+    if r.status_code in (401, 403):
+        return False, "A Groq recusou essa chave. Confira se copiou inteira (ela começa com gsk_)."
+    return False, "A Groq respondeu com erro %s. Tente novamente." % r.status_code
+
+
+def chamar_claude(modelo, system, mensagens, max_tokens=800, json_mode=True):
+    """Mantém o nome por compatibilidade: usa a Groq (chave do jogador) e, se não houver, a Anthropic (secrets)."""
     S = st.session_state
+    gk = chave_groq()
+    ak = segredo("ANTHROPIC_API_KEY")
+    if not gk and not ak:
+        raise ErroIA("Chave da API não configurada.")
     if S.get("chamadas", 0) >= MAX_CHAMADAS_POR_SESSAO:
         raise ErroIA("Limite de uso desta sessão atingido. Recomece a jornada para continuar.")
     S["chamadas"] = S.get("chamadas", 0) + 1
-    corpo = {"model": modelo, "max_tokens": max_tokens, "system": system, "messages": mensagens}
-    cab = {"x-api-key": chave, "anthropic-version": API_VERSION, "content-type": "application/json"}
+    if gk:
+        url = GROQ_URL
+        cab = {"Authorization": "Bearer " + gk, "content-type": "application/json"}
+        corpo = {"model": modelo, "max_tokens": max_tokens, "temperature": 0.8,
+                 "messages": [{"role": "system", "content": system}] + mensagens}
+        if json_mode:
+            corpo["response_format"] = {"type": "json_object"}
+    else:
+        url = API_URL
+        cab = {"x-api-key": ak, "anthropic-version": API_VERSION, "content-type": "application/json"}
+        corpo = {"model": modelo, "max_tokens": max_tokens, "system": system, "messages": mensagens}
     ultimo = None
-    for tentativa in range(2):
+    for tentativa in range(3):
         try:
-            r = requests.post(API_URL, headers=cab, json=corpo, timeout=75)
+            r = requests.post(url, headers=cab, json=corpo, timeout=75)
             if r.status_code == 200:
-                partes = r.json().get("content", [])
-                return "".join(p.get("text", "") for p in partes if p.get("type") == "text").strip()
+                d = r.json()
+                if gk:
+                    return (d["choices"][0]["message"].get("content") or "").strip()
+                return "".join(p.get("text", "") for p in d.get("content", []) if p.get("type") == "text").strip()
             ultimo = "HTTP %s" % r.status_code
+            if r.status_code == 429:
+                ultimo = "limite de uso da Groq atingido; aguarde alguns segundos"
+                time.sleep(3 + 3 * tentativa)
+                continue
             if r.status_code in (400, 401, 403, 404):
                 try:
                     ultimo += " — " + r.json().get("error", {}).get("message", "")
@@ -647,10 +692,14 @@ def extrair_json(texto):
 
 
 def modelo_ator():
+    if chave_groq():
+        return segredo("MODELO_ATOR_GROQ", GROQ_ATOR_PADRAO)
     return segredo("MODELO_ATOR", MODELO_ATOR_PADRAO)
 
 
 def modelo_avaliador():
+    if chave_groq():
+        return segredo("MODELO_AVALIADOR_GROQ", GROQ_AVALIADOR_PADRAO)
     return segredo("MODELO_AVALIADOR", MODELO_AVALIADOR_PADRAO)
 
 
@@ -711,7 +760,7 @@ def resumo_handoff(cid, et):
         "mantenha neutro.")
     try:
         return chamar_claude(modelo_avaliador(), system,
-                             [{"role": "user", "content": transcricao(cid, et["msgs"])}], max_tokens=420)
+                             [{"role": "user", "content": transcricao(cid, et["msgs"])}], max_tokens=420, json_mode=False)
     except ErroIA:
         return ""
 
@@ -859,9 +908,12 @@ def nova_etapa(cid):
 def reset_jogo(manter_prologo=True):
     S = st.session_state
     visto = S.get("prologo_visto", False) and manter_prologo
+    gk = S.get("groq_key")
     for k in list(S.keys()):
         del S[k]
     S["prologo_visto"] = visto
+    if gk:
+        S["groq_key"] = gk
     iniciar_estado()
 
 
@@ -1215,6 +1267,37 @@ def barra_etapas():
     st.markdown('<div class="etapas">%s</div>' % "".join(itens), unsafe_allow_html=True)
 
 
+def campo_chave():
+    """Campo para o jogador inserir a própria chave Groq (gratuita). Fica só nesta sessão, em memória."""
+    S = st.session_state
+    st.markdown("#### Sua chave da Groq (gratuita)")
+    if S.get("groq_key"):
+        k = S["groq_key"]
+        st.success("Chave conectada: %s…%s" % (k[:4], k[-4:]))
+        if st.button("Trocar ou remover a chave", key="trocar_chave"):
+            S.pop("groq_key", None)
+            st.rerun()
+        return
+    if segredo("GROQ_API_KEY") or segredo("ANTHROPIC_API_KEY"):
+        st.caption("Este app já tem uma chave própria configurada. Se preferir, use a sua abaixo.")
+    st.caption("Para jogar de graça: crie uma conta em console.groq.com, abra “API Keys”, gere uma chave (começa com gsk_), "
+               "copie e cole aqui. Ela vale só nesta sessão do navegador, não é salva em arquivo nem exibida de novo, e é "
+               "usada apenas para gerar as falas dos personagens. Nunca informe a senha da sua conta.")
+    chave = st.text_input("Cole sua chave da Groq", type="password", key="groq_in", placeholder="gsk_…")
+    if st.button("VALIDAR E CONECTAR", key="validar_groq", disabled=not chave.strip()):
+        c = chave.strip()
+        if not c.startswith("gsk_"):
+            st.error("A chave da Groq começa com gsk_. Confira o que copiou.")
+        else:
+            with st.spinner("Verificando a chave…"):
+                ok, msg = validar_groq(c)
+            if ok:
+                S["groq_key"] = c
+                st.rerun()
+            else:
+                st.error(msg)
+
+
 def tela_escolha():
     S = st.session_state
     cabecalho()
@@ -1241,10 +1324,8 @@ def tela_escolha():
     S.ciente = st.checkbox("Li e entendi os avisos acima (personagens criados por IA, ficção e tratamento dos dados).",
                            value=S.ciente, key="chkciente")
     pronto = S.maior18 and S.ciente
-    sem_chave = not segredo("ANTHROPIC_API_KEY")
-    if sem_chave:
-        st.error("Este app ainda não tem a chave da IA configurada. Quem publicou o app deve definir ANTHROPIC_API_KEY em "
-                 "Settings → Secrets (veja as instruções no topo do app.py).")
+    campo_chave()
+    sem_chave = not tem_chave()
     b1, b2 = st.columns(2)
     if b1.button("JOGAR GRÁTIS", type="primary", disabled=not pronto or sem_chave):
         S.tela = "prologo"
@@ -1289,7 +1370,7 @@ def tela_premium():
     if c1.button("← Voltar"):
         S.tela = "escolha"
         st.rerun()
-    if c2.button("JOGAR GRÁTIS", type="primary", disabled=not segredo("ANTHROPIC_API_KEY")):
+    if c2.button("JOGAR GRÁTIS", type="primary", disabled=not tem_chave()):
         S.tela = "prologo"
         S.prologo_t0 = time.time()
         st.rerun()
