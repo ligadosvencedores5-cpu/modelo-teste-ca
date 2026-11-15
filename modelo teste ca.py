@@ -617,17 +617,43 @@ def tem_chave():
     return bool(chave_groq() or segredo("ANTHROPIC_API_KEY"))
 
 
+def limpar_chave(chave):
+    """Remove espaços, quebras de linha, aspas e o prefixo 'Bearer ' que costumam vir junto ao colar."""
+    c = (chave or "").strip().strip("\"'`“”‘’").strip()
+    if c.lower().startswith("bearer "):
+        c = c[7:].strip()
+    return re.sub(r"\s+", "", c)
+
+
+def cab_groq(chave, json_body=False):
+    # User-Agent próprio: a Groq (via Cloudflare) costuma bloquear o User-Agent padrão do 'requests' com 403.
+    h = {"Authorization": "Bearer " + chave, "User-Agent": "casa-dos-agentes-ia/1.0", "Accept": "application/json"}
+    if json_body:
+        h["content-type"] = "application/json"
+    return h
+
+
 def validar_groq(chave):
     """Testa a chave no próprio servidor da Groq. Retorna (ok, mensagem)."""
     try:
-        r = requests.get(GROQ_MODELOS_URL, headers={"Authorization": "Bearer " + chave}, timeout=20)
-    except requests.RequestException:
-        return False, "Não foi possível conectar à Groq agora. Tente de novo."
+        r = requests.get(GROQ_MODELOS_URL, headers=cab_groq(chave), timeout=20)
+    except requests.RequestException as e:
+        return False, "Não foi possível conectar à Groq agora (%s). Tente de novo." % type(e).__name__
     if r.status_code == 200:
         return True, "Chave aceita pela Groq."
-    if r.status_code in (401, 403):
-        return False, "A Groq recusou essa chave. Confira se copiou inteira (ela começa com gsk_)."
-    return False, "A Groq respondeu com erro %s. Tente novamente." % r.status_code
+    detalhe = ""
+    try:
+        detalhe = r.json().get("error", {}).get("message", "")
+    except Exception:
+        detalhe = (r.text or "")[:120]
+    if r.status_code == 401:
+        return False, "A Groq recusou essa chave (401). Confira se copiou inteira, sem espaços, e se ela não foi revogada. %s" % detalhe
+    if r.status_code == 403:
+        return False, "A Groq bloqueou o acesso (403), o que nem sempre significa chave errada: pode ser bloqueio de rede do servidor. Detalhe: %s" % (detalhe or "sem detalhe")
+    if r.status_code == 429:
+        # chave reconhecida, só está no limite de uso
+        return True, "Chave aceita pela Groq (limite de uso momentâneo)."
+    return False, "A Groq respondeu com erro %s. %s" % (r.status_code, detalhe)
 
 
 def chamar_claude(modelo, system, mensagens, max_tokens=800, json_mode=True):
@@ -642,7 +668,7 @@ def chamar_claude(modelo, system, mensagens, max_tokens=800, json_mode=True):
     S["chamadas"] = S.get("chamadas", 0) + 1
     if gk:
         url = GROQ_URL
-        cab = {"Authorization": "Bearer " + gk, "content-type": "application/json"}
+        cab = cab_groq(gk, json_body=True)
         corpo = {"model": modelo, "max_tokens": max_tokens, "temperature": 0.8,
                  "messages": [{"role": "system", "content": system}] + mensagens}
         if json_mode:
@@ -712,7 +738,7 @@ def modelos_groq(forcar=False):
     if not gk:
         return []
     try:
-        r = requests.get(GROQ_MODELOS_URL, headers={"Authorization": "Bearer " + gk}, timeout=20)
+        r = requests.get(GROQ_MODELOS_URL, headers=cab_groq(gk), timeout=20)
         ids = [m.get("id", "") for m in r.json().get("data", []) if m.get("active", True)] if r.status_code == 200 else []
     except Exception:
         ids = []
@@ -1338,9 +1364,9 @@ def campo_chave():
                "usada apenas para gerar as falas dos personagens. Nunca informe a senha da sua conta.")
     chave = st.text_input("Cole sua chave da Groq", type="password", key="groq_in", placeholder="gsk_…")
     if st.button("VALIDAR E CONECTAR", key="validar_groq", disabled=not chave.strip()):
-        c = chave.strip()
-        if not c.startswith("gsk_"):
-            st.error("A chave da Groq começa com gsk_. Confira o que copiou.")
+        c = limpar_chave(chave)
+        if len(c) < 20:
+            st.error("A chave parece incompleta. Copie-a inteira no console da Groq (ela começa com gsk_).")
         else:
             with st.spinner("Verificando a chave…"):
                 ok, msg = validar_groq(c)
@@ -1351,6 +1377,8 @@ def campo_chave():
                 st.rerun()
             else:
                 st.error(msg)
+                if not c.startswith("gsk_"):
+                    st.caption("Atenção: chaves da Groq começam com gsk_. A que você colou começa de outro jeito.")
 
 
 def tela_escolha():
