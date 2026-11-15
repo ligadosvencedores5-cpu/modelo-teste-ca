@@ -678,20 +678,49 @@ def chamar_claude(modelo, system, mensagens, max_tokens=800, json_mode=True):
         cab = {"x-api-key": ak, "anthropic-version": API_VERSION, "content-type": "application/json"}
         corpo = {"model": modelo, "max_tokens": max_tokens, "system": system, "messages": mensagens}
     ultimo = None
-    for tentativa in range(3):
+    raciocinio = gk and any(x in str(corpo["model"]).lower() for x in ("gpt-oss", "qwen3", "deepseek-r1"))
+    if raciocinio:
+        corpo["max_tokens"] = max(max_tokens, 2500)
+        if "gpt-oss" in str(corpo["model"]).lower():
+            corpo["reasoning_effort"] = "low"
+    for tentativa in range(4):
         try:
-            r = requests.post(url, headers=cab, json=corpo, timeout=75)
+            r = requests.post(url, headers=cab, json=corpo, timeout=90)
             if r.status_code == 200:
                 d = r.json()
                 if gk:
-                    return (d["choices"][0]["message"].get("content") or "").strip()
+                    msg = d["choices"][0].get("message", {})
+                    txt = (msg.get("content") or "").strip()
+                    if txt:
+                        return txt
+                    # resposta vazia (comum em modelos de raciocínio): tenta de novo sem modo JSON e com mais folga
+                    ultimo = "o modelo devolveu resposta vazia"
+                    corpo.pop("response_format", None)
+                    corpo["max_tokens"] = max(corpo["max_tokens"], 2500)
+                    continue
                 return "".join(p.get("text", "") for p in d.get("content", []) if p.get("type") == "text").strip()
             ultimo = "HTTP %s" % r.status_code
+            try:
+                msg_erro = r.json().get("error", {}).get("message", "")
+            except Exception:
+                msg_erro = (r.text or "")[:160]
             if r.status_code == 429:
-                ultimo = "limite de uso da Groq atingido; aguarde alguns segundos"
-                time.sleep(3 + 3 * tentativa)
+                ultimo = "limite de uso da Groq atingido; aguarde alguns segundos e envie de novo"
+                time.sleep(4 + 4 * tentativa)
                 continue
-            if r.status_code in (400, 404) and gk and tentativa == 0 and "model" in r.text.lower():
+            if r.status_code == 413:
+                ultimo = "a requisição ficou grande demais para o limite do modelo escolhido (%s)" % msg_erro
+                break
+            if r.status_code >= 500:
+                ultimo = "a Groq está instável agora (HTTP %s)" % r.status_code
+                time.sleep(2 + 2 * tentativa)
+                continue
+            if r.status_code == 400 and "response_format" in corpo:
+                # modelo não aceita modo JSON: tenta sem ele (o app já extrai o JSON do texto)
+                corpo.pop("response_format", None)
+                ultimo = "HTTP 400 — %s" % msg_erro
+                continue
+            if r.status_code in (400, 404) and gk and tentativa <= 1 and "model" in (msg_erro + r.text).lower():
                 S.pop("groq_modelos", None)
                 novo = modelos_groq(forcar=True)
                 alvo = escolher_modelo(PREF_AVAL if modelo == modelo_avaliador() else PREF_ATOR, modelo)
@@ -699,15 +728,12 @@ def chamar_claude(modelo, system, mensagens, max_tokens=800, json_mode=True):
                     corpo["model"] = alvo
                     continue
             if r.status_code in (400, 401, 403, 404):
-                try:
-                    ultimo += " — " + r.json().get("error", {}).get("message", "")
-                except Exception:
-                    pass
+                ultimo += " — " + msg_erro
                 break
         except requests.RequestException as e:
-            ultimo = str(e)
+            ultimo = "falha de conexão (%s)" % type(e).__name__
         time.sleep(1.2)
-    raise ErroIA("Não foi possível falar com o serviço de IA (%s)." % (ultimo or "erro desconhecido"))
+    raise ErroIA("Não foi possível falar com o serviço de IA: %s." % (ultimo or "erro desconhecido"))
 
 
 def extrair_json(texto):
@@ -724,8 +750,8 @@ def extrair_json(texto):
         return None
 
 
-PREF_ATOR = ["gpt-oss-120b", "llama-3.3-70b", "llama-4-maverick", "llama-4-scout", "kimi", "llama-3.1-70b", "gpt-oss-20b", "qwen", "llama-3.1-8b"]
-PREF_AVAL = ["llama-3.1-8b", "gpt-oss-20b", "llama-4-scout", "llama-3.3-70b", "gpt-oss-120b", "kimi", "qwen"]
+PREF_ATOR = ["llama-3.3-70b", "llama-4-maverick", "llama-4-scout", "llama-3.1-70b", "kimi", "llama-3.1-8b", "gpt-oss-120b", "gpt-oss-20b", "qwen"]
+PREF_AVAL = ["llama-3.1-8b", "llama-4-scout", "llama-3.3-70b", "kimi", "gpt-oss-20b", "gpt-oss-120b", "qwen"]
 EXCLUIR = ("whisper", "guard", "tts", "orpheus", "playai", "embed", "distil", "compound", "safeguard")
 
 
