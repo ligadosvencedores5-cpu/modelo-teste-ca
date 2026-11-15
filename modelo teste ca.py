@@ -25,6 +25,7 @@ ARQUITETURA (Documento-Mestre, seções 6.1 a 6.8)
   - Derrota só existe no encontro com a Princesa (decisão obrigatória na 15ª troca).
 """
 
+import difflib
 import html
 import json
 import os
@@ -992,9 +993,16 @@ def rodar_ator(cid, et, modo, ava, nota=""):
         estado = bloco_estado(cid, et, modo, ava, (nota + " " + corrige).strip())
         system = base_sys.replace("{ESTADO}", estado)
         bruto = chamar_claude(modelo_ator(), system, mensagens_para_api(et), max_tokens=900)
+        st.session_state["ultimo_bruto"] = "[modelo: %s | tentativa %d]\n%s" % (modelo_ator(), tentativa + 1, (bruto or "")[:1500])
         d = extrair_json(bruto)
         r = limpar_resp(d)
         if r is not None:
+            anterior = next((separar_cena(m["texto"])[0] for m in reversed(et["msgs"]) if m["role"] == "assistant"), "")
+            if (tentativa < 2 and anterior and
+                    difflib.SequenceMatcher(None, anterior.lower(), r["fala"].lower()).ratio() > 0.8):
+                corrige = ("Você repetiu a sua fala anterior. Escreva uma fala NOVA, que reaja ao que o participante acabou de dizer "
+                           "e faça a conversa avançar.")
+                continue
             return r
         if d is None:  # modelo respondeu fora do formato JSON: aproveita o texto como fala
             fala, acao = separar_cena(re.sub(r"[{}\"]", "", bruto or ""))
@@ -1564,11 +1572,11 @@ def tela_entrando():
     st.rerun()
 
 
-def historico(cid, et, excluir_ultimo=True):
+def historico(cid, et, excluir_ultimo=False):
     ms = et["msgs"][:-1] if excluir_ultimo else et["msgs"]
     if not ms:
         return
-    with st.expander("Ver conversa anterior (%d mensagens)" % len(ms), expanded=True):
+    with st.expander("Conversa (%d mensagens)" % len(ms), expanded=True):
         for m in ms:
             if m["role"] == "user":
                 with st.chat_message("user"):
@@ -1617,6 +1625,10 @@ def tela_desafio():
         if b2.button("Sair da casa", key="sair"):
             S.estado = "ENCERRADO"
             st.rerun()
+
+    if S.get("ultimo_bruto"):
+        with st.expander("Diagnóstico: resposta bruta do modelo"):
+            st.code(S["ultimo_bruto"], language="json")
 
     prompt = st.chat_input("Escreva sua resposta para %s…" % ch["curto"], max_chars=MAX_CHARS_MENSAGEM)
     if prompt:
